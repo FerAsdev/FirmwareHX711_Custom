@@ -11,19 +11,30 @@
 #define DOUT 3
 #define CLK 2
 
+// El HX711 selecciona 10/80 SPS mediante su pin fisico RATE.
+// Usa -1 si el modulo ya viene configurado a 80 SPS o no expone RATE.
+// Si conectas RATE a un pin de la Pro Micro, escribe aqui ese numero.
+#define HX711_RATE_PIN -1
+
 HX711 scale;
 
 // =======================
 // Joystick USB
 // =======================
+// Algunos juegos ignoran dispositivos con un solo eje "Rudder".
+// Reportar el mismo pedal como Z, Rudder y Brake mejora la compatibilidad.
+#define REPORT_Z_AXIS 1
+#define REPORT_RUDDER_AXIS 1
+#define REPORT_BRAKE_AXIS 1
+
 Joystick_ Joystick(
   JOYSTICK_DEFAULT_REPORT_ID,
   JOYSTICK_TYPE_JOYSTICK,
   0, 0,
-  false, false, false,   // X, Y, Z
+  false, false, REPORT_Z_AXIS, // X, Y, Z
   false, false, false,   // Rx, Ry, Rz
-  true, false,           // Rudder, Throttle
-  false, false, false    // Accelerator, Brake, Steering
+  REPORT_RUDDER_AXIS, false, // Rudder, Throttle
+  false, REPORT_BRAKE_AXIS, false // Accelerator, Brake, Steering
 );
 
 // =======================
@@ -54,8 +65,9 @@ const bool DEFAULT_INVERT_SIGNAL = false;
 // =======================
 // Ajustes de respuesta
 // =======================
-// El HX711 entrega datos nuevos a 10 SPS o 80 SPS segun el pin RATE.
+// A 80 SPS hay una muestra nueva aproximadamente cada 12.5 ms.
 // El USB reporta mas rapido para que el simulador vea el ultimo valor estable.
+const unsigned int EXPECTED_HX711_SPS = 80;
 const unsigned long JOYSTICK_INTERVAL_MS = 2;
 const unsigned long HX711_STALE_MS = 250;
 
@@ -70,6 +82,9 @@ const int JOYSTICK_NOISE_BAND = 1;
 long latestRaw = 0;
 bool hasLatestRaw = false;
 unsigned long lastSampleMs = 0;
+unsigned long lastSampleUs = 0;
+unsigned long measuredSampleIntervalUs = 0;
+unsigned long totalHx711Samples = 0;
 
 int targetBrake = 0;
 float smoothBrake = 0.0;
@@ -168,6 +183,56 @@ void updateTargetFromRaw(long raw) {
   targetBrake = rawToJoystick(pedal);
 }
 
+void sendBrakeJoystickValue(int value) {
+  if (value < 0) value = 0;
+  if (value > 1023) value = 1023;
+
+#if REPORT_Z_AXIS
+  Joystick.setZAxis(value);
+#endif
+
+#if REPORT_RUDDER_AXIS
+  Joystick.setRudder(value);
+#endif
+
+#if REPORT_BRAKE_AXIS
+  Joystick.setBrake(value);
+#endif
+}
+
+void recordHx711Sample(long raw, bool updateJoystickTarget = true) {
+  unsigned long nowUs = micros();
+
+  if (lastSampleUs != 0) {
+    unsigned long sampleIntervalUs = nowUs - lastSampleUs;
+
+    if (measuredSampleIntervalUs == 0) {
+      measuredSampleIntervalUs = sampleIntervalUs;
+    } else {
+      measuredSampleIntervalUs =
+        (measuredSampleIntervalUs * 7UL + sampleIntervalUs) / 8UL;
+    }
+  }
+
+  lastSampleUs = nowUs;
+  latestRaw = raw;
+  hasLatestRaw = true;
+  lastSampleMs = millis();
+  totalHx711Samples++;
+
+  if (updateJoystickTarget) {
+    updateTargetFromRaw(raw);
+  }
+}
+
+float getMeasuredHx711Sps() {
+  if (measuredSampleIntervalUs == 0) {
+    return 0.0;
+  }
+
+  return 1000000.0 / (float)measuredSampleIntervalUs;
+}
+
 // =======================
 // Lectura HX711
 // =======================
@@ -176,10 +241,7 @@ bool readRawNonBlocking() {
     return false;
   }
 
-  latestRaw = scale.read();
-  hasLatestRaw = true;
-  lastSampleMs = millis();
-  updateTargetFromRaw(latestRaw);
+  recordHx711Sample(scale.read());
 
   return true;
 }
@@ -202,9 +264,7 @@ long readRawBlocking(byte samples = 1, unsigned int timeoutPerSampleMs = 150) {
       long raw = scale.read();
       sum += raw;
       validSamples++;
-      latestRaw = raw;
-      hasLatestRaw = true;
-      lastSampleMs = millis();
+      recordHx711Sample(raw);
     }
   }
 
@@ -250,9 +310,7 @@ void calibrateMax() {
       long raw = scale.read();
       long value = rawToDelta(raw);
 
-      latestRaw = raw;
-      hasLatestRaw = true;
-      lastSampleMs = millis();
+      recordHx711Sample(raw, false);
 
       if (value > maxValue) {
         maxValue = value;
@@ -326,6 +384,17 @@ void printStatus() {
   Serial.print("Last Sample Age ms: ");
   Serial.println(hasLatestRaw ? millis() - lastSampleMs : 0);
 
+  Serial.print("HX711 Sample Rate: ");
+  Serial.print(getMeasuredHx711Sps(), 1);
+  Serial.println(" SPS");
+
+  Serial.print("Expected HX711 Rate: ");
+  Serial.print(EXPECTED_HX711_SPS);
+  Serial.println(" SPS");
+
+  Serial.print("Total HX711 Samples: ");
+  Serial.println(totalHx711Samples);
+
   Serial.print("Current RAW: ");
   Serial.println(raw);
 
@@ -366,6 +435,23 @@ void printRawOnce() {
   Serial.println(joy);
 }
 
+void printHx711Rate() {
+  float measuredSps = getMeasuredHx711Sps();
+
+  Serial.print("HX711 RATE: ");
+  Serial.print(measuredSps, 1);
+  Serial.println(" SPS");
+
+  if (measuredSps >= 60.0) {
+    Serial.println("Modo detectado: aproximadamente 80 SPS.");
+  } else if (measuredSps >= 7.0 && measuredSps <= 15.0) {
+    Serial.println("Modo detectado: aproximadamente 10 SPS.");
+    Serial.println("El pin fisico RATE del HX711 debe estar en HIGH/VCC para 80 SPS.");
+  } else {
+    Serial.println("Frecuencia aun inestable. Espera dos segundos y envia RATE otra vez.");
+  }
+}
+
 void monitorPedal() {
   Serial.println("Monitor activo por 10 segundos...");
   Serial.println("Pisa y suelta el pedal para ver los valores.");
@@ -391,6 +477,7 @@ void monitorPedal() {
 void printHelp() {
   Serial.println("Comandos disponibles:");
   Serial.println("STATUS");
+  Serial.println("RATE");
   Serial.println("RAW");
   Serial.println("MONITOR");
   Serial.println("TARE");
@@ -424,6 +511,9 @@ void processCommand(char *input) {
   }
   else if (strcmp(command, "STATUS") == 0) {
     printStatus();
+  }
+  else if (strcmp(command, "RATE") == 0) {
+    printHx711Rate();
   }
   else if (strcmp(command, "RAW") == 0) {
     printRawOnce();
@@ -529,15 +619,29 @@ void setup() {
 
   loadConfig();
 
+#if HX711_RATE_PIN >= 0
+  pinMode(HX711_RATE_PIN, OUTPUT);
+  digitalWrite(HX711_RATE_PIN, HIGH);
+#endif
+
   scale.begin(DOUT, CLK);
 
   Joystick.begin(false);
+#if REPORT_Z_AXIS
+  Joystick.setZAxisRange(0, 1023);
+#endif
+#if REPORT_RUDDER_AXIS
   Joystick.setRudderRange(0, 1023);
-  Joystick.setRudder(0);
+#endif
+#if REPORT_BRAKE_AXIS
+  Joystick.setBrakeRange(0, 1023);
+#endif
+  sendBrakeJoystickValue(0);
   Joystick.sendState();
 
   Serial.println("Pedal HX711 iniciado - simracing rapido.");
-  Serial.println("Comandos: HELP, STATUS, RAW, MONITOR, TARE, MAX, INVERT, RESET");
+  Serial.println("Objetivo HX711: 80 SPS (12.5 ms por muestra).");
+  Serial.println("Comandos: HELP, STATUS, RATE, RAW, MONITOR, TARE, MAX, INVERT, RESET");
 
   if (scale.is_ready()) {
     readRawNonBlocking();
@@ -574,7 +678,7 @@ void loop() {
     if (smoothBrake < 0) smoothBrake = 0;
     if (smoothBrake > 1023) smoothBrake = 1023;
 
-    Joystick.setRudder((int)(smoothBrake + 0.5));
+    sendBrakeJoystickValue((int)(smoothBrake + 0.5));
     Joystick.sendState();
   }
 }
