@@ -21,17 +21,27 @@ HX711 scale;
 // =======================
 // Joystick USB
 // =======================
-// Algunos juegos ignoran dispositivos con un solo eje "Rudder".
-// Reportar el mismo pedal como Z, Rudder y Brake mejora la compatibilidad.
-#define REPORT_Z_AXIS 1
-#define REPORT_RUDDER_AXIS 1
-#define REPORT_BRAKE_AXIS 1
+// ATS puede rechazar la asignacion si varios ejes cambian simultaneamente.
+// Un solo eje X generico ofrece la mayor compatibilidad DirectInput.
+#define HID_SINGLE_AXIS_COMPATIBILITY 1
+
+#if HID_SINGLE_AXIS_COMPATIBILITY
+  #define REPORT_X_AXIS 1
+  #define REPORT_Z_AXIS 0
+  #define REPORT_RUDDER_AXIS 0
+  #define REPORT_BRAKE_AXIS 0
+#else
+  #define REPORT_X_AXIS 0
+  #define REPORT_Z_AXIS 1
+  #define REPORT_RUDDER_AXIS 1
+  #define REPORT_BRAKE_AXIS 1
+#endif
 
 Joystick_ Joystick(
   JOYSTICK_DEFAULT_REPORT_ID,
   JOYSTICK_TYPE_JOYSTICK,
-  0, 0,
-  false, false, REPORT_Z_AXIS, // X, Y, Z
+  1, 0, // Un boton inactivo ayuda a enumerar como joystick DirectInput.
+  REPORT_X_AXIS, false, REPORT_Z_AXIS, // X, Y, Z
   false, false, false,   // Rx, Ry, Rz
   REPORT_RUDDER_AXIS, false, // Rudder, Throttle
   false, REPORT_BRAKE_AXIS, false // Accelerator, Brake, Steering
@@ -186,6 +196,10 @@ void updateTargetFromRaw(long raw) {
 void sendBrakeJoystickValue(int value) {
   if (value < 0) value = 0;
   if (value > 1023) value = 1023;
+
+#if REPORT_X_AXIS
+  Joystick.setXAxis(value);
+#endif
 
 #if REPORT_Z_AXIS
   Joystick.setZAxis(value);
@@ -627,6 +641,9 @@ void setup() {
   scale.begin(DOUT, CLK);
 
   Joystick.begin(false);
+#if REPORT_X_AXIS
+  Joystick.setXAxisRange(0, 1023);
+#endif
 #if REPORT_Z_AXIS
   Joystick.setZAxisRange(0, 1023);
 #endif
